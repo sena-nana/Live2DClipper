@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
-import type { GenerationPayload, LayerNode, SplitPartType, SplitTier } from '../types/layers';
+import type { GenerationPayload, LayerEditSpec, LayerNode, LayerRole, LayerSide, SplitPartType, SplitTier } from '../types/layers';
 import { buildSplitPrompt } from '../data/prompts';
 import { getTierConfig } from '../data/splitTiers';
 import { runOpenAICompatibleGeneration } from '../services/openaiCompatibleProvider';
@@ -8,6 +8,22 @@ import { exportLayersToPsd } from '../services/psdExporter';
 import { loadOpenAISettings, saveOpenAISettings } from '../services/settingsStorage';
 import { createId } from '../utils/id';
 import { fileToDataUrl } from '../utils/image';
+import {
+  addBackfillLayerForSource,
+  addSourceToLayer,
+  approveLayerNode,
+  canDeleteLayerNode,
+  createLayerNode,
+  defaultEditSpec,
+  markLayerAsReference,
+  normalizeTree,
+  planSplitForLayer,
+  recordLayerRevision,
+  rejectLayerNode,
+  syncApprovedLayerToApplied,
+  tierOrDefault,
+  updateLayerTaskSpec,
+} from '../utils/layerTasks';
 import {
   cloneTree,
   collectChangedLayers,
@@ -33,10 +49,16 @@ const createInitialTree = (): LayerNode[] => [
     type: 'group',
     partType: 'base',
     status: 'clean',
+    role: 'artwork',
+    side: 'none',
+    exportable: false,
     visible: true,
     solo: false,
     locked: false,
     opacity: 1,
+    sources: [],
+    editSpec: defaultEditSpec(),
+    revisions: [],
     children: [
       {
         id: createId('layer'),
@@ -44,11 +66,21 @@ const createInitialTree = (): LayerNode[] => [
         type: 'layer',
         partType: 'hair',
         status: 'dirty',
+        role: 'artwork',
+        side: 'none',
+        exportable: true,
         visible: true,
         solo: false,
         locked: false,
         opacity: 1,
         promptHint: '拆出前发、后发与发丝半透明边缘。',
+        sources: [],
+        editSpec: {
+          ...defaultEditSpec('split'),
+          instruction: '拆出前发、后发与发丝半透明边缘。',
+          targetStructure: '前发、后发、发丝边缘',
+        },
+        revisions: [],
       },
       {
         id: createId('layer'),
@@ -56,10 +88,16 @@ const createInitialTree = (): LayerNode[] => [
         type: 'layer',
         partType: 'face',
         status: 'clean',
+        role: 'artwork',
+        side: 'front',
+        exportable: true,
         visible: true,
         solo: false,
         locked: false,
         opacity: 1,
+        sources: [],
+        editSpec: defaultEditSpec(),
+        revisions: [],
       },
       {
         id: createId('layer'),
@@ -67,10 +105,16 @@ const createInitialTree = (): LayerNode[] => [
         type: 'layer',
         partType: 'clothing',
         status: 'clean',
+        role: 'artwork',
+        side: 'front',
+        exportable: true,
         visible: true,
         solo: false,
         locked: false,
         opacity: 1,
+        sources: [],
+        editSpec: defaultEditSpec(),
+        revisions: [],
       },
     ],
   },
@@ -80,10 +124,16 @@ const createInitialTree = (): LayerNode[] => [
     type: 'group',
     partType: 'effect',
     status: 'clean',
+    role: 'artwork',
+    side: 'none',
+    exportable: false,
     visible: true,
     solo: false,
     locked: false,
     opacity: 1,
+    sources: [],
+    editSpec: defaultEditSpec(),
+    revisions: [],
     children: [
       {
         id: createId('layer'),
@@ -91,10 +141,16 @@ const createInitialTree = (): LayerNode[] => [
         type: 'layer',
         partType: 'shadow',
         status: 'clean',
+        role: 'artwork',
+        side: 'none',
+        exportable: true,
         visible: true,
         solo: false,
         locked: false,
         opacity: 0.72,
+        sources: [],
+        editSpec: defaultEditSpec(),
+        revisions: [],
       },
     ],
   },
@@ -104,7 +160,7 @@ export const useProjectStore = defineStore('project', () => {
   const projectName = ref('Live2D 拆分项目');
   const sourceImageUrl = ref<string | null>(null);
   const guideDrawingUrl = ref<string | null>(null);
-  const draftTree = ref<LayerNode[]>(createInitialTree());
+  const draftTree = ref<LayerNode[]>(normalizeTree(createInitialTree()));
   const appliedTree = ref<LayerNode[]>(cloneTree(draftTree.value));
   const selectedLayerId = ref<string | null>(flattenTree(draftTree.value).find((layer) => layer.type === 'layer')?.id ?? null);
   const selectedTier = ref<SplitTier>('standard');
@@ -147,6 +203,14 @@ export const useProjectStore = defineStore('project', () => {
   };
 
   const setGuideDrawingUrl = (url: string | null) => {
+    if (selectedLayerId.value) {
+      draftTree.value = updateLayer(draftTree.value, selectedLayerId.value, (layer) => ({
+        ...layer,
+        guideImageUrl: url ?? undefined,
+      }));
+      return;
+    }
+
     guideDrawingUrl.value = url;
   };
 
@@ -191,8 +255,22 @@ export const useProjectStore = defineStore('project', () => {
     draftTree.value = updateLayer(draftTree.value, id, (layer) => ({ ...layer, partType, status: 'dirty' }));
   };
 
+  const updateLayerTask = (
+    id: string,
+    patch: Partial<Pick<LayerNode, 'partType' | 'role' | 'side' | 'exportable'>> & {
+      editSpec?: Partial<LayerEditSpec>;
+    },
+  ) => {
+    draftTree.value = updateLayerTaskSpec(draftTree.value, id, patch);
+  };
+
   const deleteLayer = (id: string) => {
     if (pendingReview.value) {
+      return;
+    }
+
+    if (!canDeleteLayerNode(draftTree.value, id)) {
+      generationMessage.value = '该图层仍被其他图层引用，先移除来源关系后再删除';
       return;
     }
 
@@ -220,35 +298,22 @@ export const useProjectStore = defineStore('project', () => {
   };
 
   const addLayer = (partType: SplitPartType = 'base') => {
-    const newLayer: LayerNode = {
-      id: createId('layer'),
+    const newLayer = createLayerNode({
       name: `新图层 ${flatDraftLayers.value.filter((layer) => layer.type === 'layer').length + 1}`,
-      type: 'layer',
       partType,
-      status: 'dirty',
-      visible: true,
-      solo: false,
-      locked: false,
-      opacity: 1,
-    };
+    });
 
     draftTree.value = [...draftTree.value, newLayer];
     selectedLayerId.value = newLayer.id;
   };
 
   const addGroup = () => {
-    const group: LayerNode = {
-      id: createId('group'),
+    const group = createLayerNode({
       name: `新分组 ${flatDraftLayers.value.filter((layer) => layer.type === 'group').length + 1}`,
       type: 'group',
-      partType: 'base',
-      status: 'dirty',
-      visible: true,
-      solo: false,
-      locked: false,
-      opacity: 1,
+      exportable: false,
       children: [],
-    };
+    });
 
     draftTree.value = [...draftTree.value, group];
     selectedLayerId.value = group.id;
@@ -287,6 +352,41 @@ export const useProjectStore = defineStore('project', () => {
     selectedLayerId.value = id;
   };
 
+  const planSplit = (id: string) => {
+    if (pendingReview.value) {
+      return;
+    }
+
+    draftTree.value = planSplitForLayer(draftTree.value, id);
+    generationMessage.value = '已创建拆分目标图层';
+  };
+
+  const addBackfillLayer = (id: string) => {
+    if (pendingReview.value) {
+      return;
+    }
+
+    draftTree.value = addBackfillLayerForSource(draftTree.value, id);
+    generationMessage.value = '已创建背面补全图层';
+  };
+
+  const markReference = (id: string) => {
+    if (pendingReview.value) {
+      return;
+    }
+
+    draftTree.value = markLayerAsReference(draftTree.value, id);
+    generationMessage.value = '已设为参考源图层';
+  };
+
+  const addSelectedLayerSource = (sourceId: string, role: 'primary' | 'style' | 'occlusion' | 'mask' = 'primary') => {
+    if (!selectedLayerId.value || pendingReview.value) {
+      return;
+    }
+
+    draftTree.value = addSourceToLayer(draftTree.value, selectedLayerId.value, sourceId, role);
+  };
+
   const runGeneration = async (layerId?: string) => {
     if (isGenerating.value || pendingReview.value) {
       return;
@@ -298,7 +398,7 @@ export const useProjectStore = defineStore('project', () => {
         ? [requestedLayer]
         : changedLayers.value.length > 0
           ? changedLayers.value
-          : flatDraftLayers.value.filter((layer) => layer.type === 'layer');
+          : flatDraftLayers.value.filter((layer) => layer.type === 'layer' && layer.role !== 'reference');
     if (changed.length === 0) {
       return;
     }
@@ -310,11 +410,14 @@ export const useProjectStore = defineStore('project', () => {
     }
 
     isGenerating.value = true;
-    generationMessage.value = `正在生成 ${tierConfig.value.outputCount} 个背景版本`;
+    const maxOutputCount = Math.max(
+      ...changed.map((layer) => getTierConfig(tierOrDefault(layer.editSpec.algorithmOverride, selectedTier.value)).outputCount),
+    );
+    generationMessage.value = `正在生成最多 ${maxOutputCount} 个背景版本`;
     const ids = changed.map((layer) => layer.id);
     draftTree.value = updateLayerStatus(draftTree.value, ids, 'generating');
 
-    const prompt = buildSplitPrompt(selectedTier.value, changed);
+    const prompt = buildSplitPrompt(selectedTier.value, changed, flatDraftLayers.value);
     lastPrompt.value = prompt;
 
     const payload: GenerationPayload = {
@@ -338,6 +441,11 @@ export const useProjectStore = defineStore('project', () => {
           status: 'pendingReview',
           imageUrl: result.rgbaUrl,
         }));
+        draftTree.value = recordLayerRevision(draftTree.value, result.layerId, {
+          operation: result.operation,
+          promptRecipe: result.promptRecipe,
+          imageUrl: result.rgbaUrl,
+        });
       }
 
       generationMessage.value = '生成完成，等待审核';
@@ -353,6 +461,17 @@ export const useProjectStore = defineStore('project', () => {
     draftTree.value = markTreeClean(draftTree.value);
     appliedTree.value = cloneTree(draftTree.value);
     generationMessage.value = '已确认，可继续编辑';
+  };
+
+  const approveLayer = (id: string) => {
+    draftTree.value = approveLayerNode(draftTree.value, id);
+    appliedTree.value = syncApprovedLayerToApplied(appliedTree.value, draftTree.value, id);
+    generationMessage.value = '已确认图层';
+  };
+
+  const rejectLayer = (id: string) => {
+    draftTree.value = rejectLayerNode(appliedTree.value, draftTree.value, id);
+    generationMessage.value = '已拒绝图层生成';
   };
 
   const rejectPending = () => {
@@ -397,6 +516,7 @@ export const useProjectStore = defineStore('project', () => {
     markLayerDirty,
     renameLayer,
     setLayerPartType,
+    updateLayerTask,
     deleteLayer,
     mergeLayerInto,
     toggleLayerVisible,
@@ -407,9 +527,15 @@ export const useProjectStore = defineStore('project', () => {
     indentSelectedLayer,
     outdentSelectedLayer,
     moveLayerTo,
+    planSplit,
+    addBackfillLayer,
+    markReference,
+    addSelectedLayerSource,
     runGeneration,
     approvePending,
+    approveLayer,
     rejectPending,
+    rejectLayer,
     exportPsd,
   };
 });

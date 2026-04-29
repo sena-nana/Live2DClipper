@@ -1,4 +1,4 @@
-import type { FlatLayerNode, LayerNode, LayerStatus } from '../types/layers';
+import type { FlatLayerNode, LayerNode, LayerSourceRef, LayerStatus } from '../types/layers';
 
 export const cloneTree = (nodes: LayerNode[]): LayerNode[] =>
   nodes.map((node) => ({
@@ -63,7 +63,9 @@ export const updateLayerStatus = (nodes: LayerNode[], ids: string[], status: Lay
   }));
 
 export const collectChangedLayers = (nodes: LayerNode[]) =>
-  flattenTree(nodes).filter((node) => node.type === 'layer' && node.status === 'dirty');
+  flattenTree(nodes).filter(
+    (node) => node.type === 'layer' && node.status === 'dirty' && node.role !== 'reference' && node.exportable,
+  );
 
 export const hasPendingReview = (nodes: LayerNode[]) =>
   flattenTree(nodes).some((node) => node.status === 'pendingReview');
@@ -185,6 +187,23 @@ export const moveLayerToParent = (
   return nextNodes;
 };
 
+export const insertLayerAfter = (nodes: LayerNode[], afterId: string, newNode: LayerNode): LayerNode[] => {
+  const nextNodes = cloneTree(nodes);
+  const siblings = findSiblings(nextNodes, afterId);
+
+  if (!siblings) {
+    return nodes;
+  }
+
+  const index = siblings.findIndex((node) => node.id === afterId);
+  if (index < 0) {
+    return nodes;
+  }
+
+  siblings.splice(index + 1, 0, newNode);
+  return nextNodes;
+};
+
 export const deleteLayerNode = (nodes: LayerNode[], id: string): LayerNode[] => {
   const nextNodes = cloneTree(nodes);
   const removed = removeNode(nextNodes, id);
@@ -207,9 +226,41 @@ export const mergeLayerNodeInto = (nodes: LayerNode[], sourceId: string, targetI
   return updateLayer(nextNodes, targetId, (layer) => ({
     ...layer,
     name: `${layer.name} + ${source.name}`,
+    editSpec: {
+      ...layer.editSpec,
+      operation: 'merge',
+      instruction: [layer.editSpec.instruction, `合并「${source.name}」作为同一输出图层。`]
+        .filter(Boolean)
+        .join('\n'),
+    },
+    sources: mergeLayerSources(layer.sources, [
+      ...source.sources,
+      {
+        layerId: source.id,
+        role: 'primary',
+        note: `合并来源：${source.name}`,
+      },
+    ]),
     status: layer.status === 'pendingReview' ? layer.status : 'dirty',
     promptHint: [layer.promptHint, `合并来源：${source.name}`].filter(Boolean).join('；'),
   }));
+};
+
+const mergeLayerSources = (base: LayerSourceRef[], incoming: LayerSourceRef[]) => {
+  const next: LayerSourceRef[] = [];
+  const seen = new Set<string>();
+
+  for (const source of [...base, ...incoming]) {
+    const key = `${source.layerId}:${source.role}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    next.push(source);
+  }
+
+  return next;
 };
 
 const findSiblings = (nodes: LayerNode[], id: string): LayerNode[] | null => {

@@ -2,6 +2,7 @@ import { writePsd } from 'ag-psd';
 import type { LayerNode } from '../types/layers';
 import { flattenTree } from '../utils/tree';
 import { loadImage } from '../utils/image';
+import { isExportablePsdLayer } from '../utils/layerTasks';
 
 const dataUrlToCanvas = async (url: string) => {
   const image = await loadImage(url);
@@ -23,7 +24,7 @@ export const exportLayersToPsd = async (
   sourceImageUrl: string | null,
   layers: LayerNode[],
 ) => {
-  const flatLayers = flattenTree(layers).filter((layer) => layer.type === 'layer' && layer.imageUrl);
+  const flatLayers = flattenTree(layers).filter(isExportablePsdLayer);
   const canvases = await Promise.all(flatLayers.map((layer) => dataUrlToCanvas(layer.imageUrl ?? '')));
   const sourceCanvas = sourceImageUrl ? await dataUrlToCanvas(sourceImageUrl) : canvases[0];
   const width = sourceCanvas?.width ?? 1024;

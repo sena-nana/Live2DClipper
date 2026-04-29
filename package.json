@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "tsc -p tsconfig.test.json && node -e \"require('fs').writeFileSync('.test-dist/package.json', '{\\\"type\\\":\\\"commonjs\\\"}')\" && node .test-dist/tests/layerTasks.test.js",
     "typecheck": "vue-tsc --noEmit --pretty false",
     "build": "vue-tsc --noEmit --pretty false && vite build",
     "preview": "vite preview --host 127.0.0.1"

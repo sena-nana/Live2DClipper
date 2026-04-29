@@ -1,5 +1,6 @@
-import type { LayerNode, SplitPartType, SplitTier } from '../types/layers';
+import type { FlatLayerNode, LayerNode, SplitPartType, SplitTier } from '../types/layers';
 import { getTierConfig } from './splitTiers';
+import { operationLabel, sideLabel, tierOrDefault } from '../utils/layerTasks';
 
 const PART_PROMPTS: Record<SplitPartType, string> = {
   base: '保持角色基础轮廓、躯干遮挡补全和 Live2D 可绑定边缘。',
@@ -26,11 +27,28 @@ const TIER_PROMPTS: Record<SplitTier, string> = {
     '使用黑、白、红、绿、蓝五背景最小二乘 matting。请输出同一前景分别位于五种纯色背景上的版本，前景形状、位置、轮廓、发光、毛发和材质必须完全一致。',
 };
 
-export const buildSplitPrompt = (tier: SplitTier, changedLayers: LayerNode[]) => {
+const sourceName = (flatLayers: FlatLayerNode[], id: string) =>
+  flatLayers.find((layer) => layer.id === id)?.name ?? id;
+
+export const buildSplitPrompt = (tier: SplitTier, changedLayers: LayerNode[], flatLayers: FlatLayerNode[] = []) => {
   const config = getTierConfig(tier);
   const partLines = changedLayers.map((layer) => {
     const partPrompt = PART_PROMPTS[layer.partType] ?? PART_PROMPTS.base;
-    return `- ${layer.name}: ${partPrompt}`;
+    const layerTier = getTierConfig(tierOrDefault(layer.editSpec.algorithmOverride, tier));
+    const sources = layer.sources.length
+      ? layer.sources
+          .map((source) => `${source.role}=${sourceName(flatLayers, source.layerId)}（${source.note}）`)
+          .join('；')
+      : '无显式来源，参考原始立绘。';
+    return [
+      `- ${layer.name}: ${partPrompt}`,
+      `  操作：${operationLabel(layer.editSpec.operation)} / ${layer.editSpec.operation}；方位：${sideLabel(layer.side) || 'none'}；导出：${layer.exportable ? '是' : '否'}。`,
+      `  来源：${sources}`,
+      `  目标结构：${layer.editSpec.targetStructure || '按图层名与部件类型判断'}`,
+      `  单层说明：${layer.editSpec.instruction || layer.promptHint || '按 Live2D 可绑定拆分补齐。'}`,
+      `  补边：${layer.editSpec.edgePadding}px；成对部件：${layer.editSpec.paired ? '是' : '否'}；遮罩层：${layer.editSpec.asMask ? '是' : '否'}。`,
+      `  算法覆盖：${layerTier.name}。`,
+    ].join('\n');
   });
 
   const backgroundLines = config.backgrounds.map(

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .vite/
+.test-dist/
 .npm-cache/
 *.local
 *.log

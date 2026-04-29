@@ -8,6 +8,14 @@ export type LayerStatus =
   | 'approved'
   | 'failed';
 
+export type LayerRole = 'artwork' | 'reference' | 'guide' | 'mask';
+
+export type LayerSide = 'none' | 'front' | 'back' | 'left' | 'right' | 'inner';
+
+export type LayerSourceRole = 'primary' | 'style' | 'occlusion' | 'mask';
+
+export type LayerOperation = 'manual' | 'split' | 'backfill' | 'occlusionFill' | 'repair' | 'merge';
+
 export type SplitPartType =
   | 'base'
   | 'hair'
@@ -27,18 +35,49 @@ export interface LayerNode {
   type: 'group' | 'layer';
   partType: SplitPartType;
   status: LayerStatus;
+  role: LayerRole;
+  side: LayerSide;
+  exportable: boolean;
   visible: boolean;
   solo: boolean;
   locked: boolean;
   opacity: number;
   children?: LayerNode[];
   imageUrl?: string;
+  guideImageUrl?: string;
   promptHint?: string;
+  sources: LayerSourceRef[];
+  editSpec: LayerEditSpec;
+  revisions: LayerRevision[];
 }
 
 export interface FlatLayerNode extends LayerNode {
   depth: number;
   parentId: string | null;
+}
+
+export interface LayerSourceRef {
+  layerId: string;
+  role: LayerSourceRole;
+  note: string;
+}
+
+export interface LayerEditSpec {
+  operation: LayerOperation;
+  instruction: string;
+  edgePadding: number;
+  paired: boolean;
+  asMask: boolean;
+  algorithmOverride: SplitTier | null;
+  targetStructure: string;
+}
+
+export interface LayerRevision {
+  id: string;
+  createdAt: string;
+  operation: LayerOperation;
+  promptRecipe: string;
+  imageUrl?: string;
 }
 
 export interface MatteBackground {
@@ -95,6 +134,7 @@ export interface OpenAICompatibleSettings {
 export interface GenerationResult {
   tier: SplitTier;
   layerId: string;
+  operation: LayerOperation;
   rgbaUrl: string;
   promptRecipe: string;
 }

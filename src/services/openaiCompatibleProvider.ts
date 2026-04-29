@@ -6,6 +6,8 @@ import type {
   OpenAICompatibleSettings,
 } from '../types/layers';
 import { buildMergeRecipePrompt } from '../data/prompts';
+import { getTierConfig } from '../data/splitTiers';
+import { tierOrDefault } from '../utils/layerTasks';
 import {
   recoverFromBlackWhite,
   recoverFromEstimate,
@@ -74,6 +76,12 @@ const imagePromptForBackground = (
     payload.prompt,
     '',
     `当前只处理图层：${layer.name}。图层类型：${layer.partType}。`,
+    `图层操作：${layer.editSpec.operation}。方位：${layer.side}。目标结构：${layer.editSpec.targetStructure || '按图层名判断'}。`,
+    `单层修改说明：${layer.editSpec.instruction || layer.promptHint || '按 Live2D 可绑定拆分补齐。'}`,
+    `补边需求：向遮挡区域合理延展约 ${layer.editSpec.edgePadding}px；成对部件：${layer.editSpec.paired ? '是' : '否'}；遮罩层：${layer.editSpec.asMask ? '是' : '否'}。`,
+    layer.sources.length > 0
+      ? `来源图层：${layer.sources.map((source) => `${source.role}:${source.layerId}(${source.note})`).join('；')}。`
+      : '',
     layer.promptHint ? `图层补充要求：${layer.promptHint}。` : '',
     mode === 'color'
       ? '请先生成该图层的颜色结果，背景保持简单中性，不需要在本步输出透明通道。'
@@ -83,7 +91,7 @@ const imagePromptForBackground = (
       : background.role === 'estimate'
         ? '使用高频检查背景估算边界；不需要恢复真实透明度。'
         : `背景必须是严格纯色 ${background.hex.toUpperCase()}，不要添加纹理、光照、阴影、渐变或环境。`,
-    payload.guideImageUrl
+    (layer.guideImageUrl || payload.guideImageUrl)
       ? '用户提供了一张透明背景的绘制指导图作为额外参考。请把其中的笔触理解为拆分边界、补全部位、透明区域或局部修改意图，不要把彩色笔触原样画进最终图像。'
       : '',
     '保持前景主体、轮廓、半透明区域、发光、毛发、材质和位置完全不变。',
@@ -110,15 +118,18 @@ export const runOpenAICompatibleGeneration = async (
   const results: GenerationResult[] = [];
 
   for (const layer of targetLayers) {
-    if (payload.tier === 'modelAlpha') {
-      const colorUrl = await requestImageVersion(payload, layer, payload.backgrounds[0], settings, 'color');
-      const alphaUrl = await requestImageVersion(payload, layer, payload.backgrounds[0], settings, 'alpha', colorUrl);
+    const layerTier = tierOrDefault(layer.editSpec.algorithmOverride, payload.tier);
+    const layerConfig = getTierConfig(layerTier);
+    if (layerTier === 'modelAlpha') {
+      const colorUrl = await requestImageVersion(payload, layer, layerConfig.backgrounds[0], settings, 'color');
+      const alphaUrl = await requestImageVersion(payload, layer, layerConfig.backgrounds[0], settings, 'alpha', colorUrl);
       const recovered = await recoverFromModelAlpha(colorUrl, alphaUrl);
       const recipe = await requestMergeRecipe(payload, layer, settings);
 
       results.push({
-        tier: payload.tier,
+        tier: layerTier,
         layerId: layer.id,
+        operation: layer.editSpec.operation,
         rgbaUrl: recovered.rgbaUrl,
         promptRecipe: recipe,
       });
@@ -127,23 +138,24 @@ export const runOpenAICompatibleGeneration = async (
 
     const composites: CompositeInput[] = [];
 
-    for (const background of payload.backgrounds) {
+    for (const background of layerConfig.backgrounds) {
       const compositeUrl = await requestImageVersion(payload, layer, background, settings);
       composites.push({ background, url: compositeUrl });
     }
 
     const recovered =
-      payload.tier === 'estimate'
+      layerTier === 'estimate'
         ? await recoverFromEstimate(composites[0])
-        : payload.tier === 'standard'
+        : layerTier === 'standard'
           ? await recoverFromBlackWhite(composites[0], composites[1])
           : await recoverFromMultiBackground(composites);
 
     const recipe = await requestMergeRecipe(payload, layer, settings);
 
     results.push({
-      tier: payload.tier,
+      tier: layerTier,
       layerId: layer.id,
+      operation: layer.editSpec.operation,
       rgbaUrl: recovered.rgbaUrl,
       promptRecipe: recipe,
     });
@@ -167,7 +179,7 @@ const requestImageVersion = async (
 
   if (
     settings.imageApiMode === 'edits' &&
-    (payload.sourceImageUrl || payload.guideImageUrl || colorReferenceUrl)
+    (payload.sourceImageUrl || layer.guideImageUrl || payload.guideImageUrl || colorReferenceUrl)
   ) {
     const formData = new FormData();
     formData.append('model', settings.imageModel.trim());
@@ -184,7 +196,9 @@ const requestImageVersion = async (
 
     const inputImages = [
       payload.sourceImageUrl ? { url: payload.sourceImageUrl, name: 'source.png' } : null,
-      payload.guideImageUrl ? { url: payload.guideImageUrl, name: 'drawing-guide.png' } : null,
+      layer.guideImageUrl || payload.guideImageUrl
+        ? { url: layer.guideImageUrl ?? payload.guideImageUrl ?? '', name: 'drawing-guide.png' }
+        : null,
       colorReferenceUrl ? { url: colorReferenceUrl, name: 'color-result.png' } : null,
     ].filter((image): image is { url: string; name: string } => Boolean(image));
     const imageFieldName = inputImages.length > 1 ? 'image[]' : 'image';
@@ -210,7 +224,7 @@ const requestImageVersion = async (
       payload.sourceImageUrl
         ? '用户上传了原始立绘，但当前接口模式为 generations，无法直接传入参考图；请根据文本要求生成背景版本。'
         : '',
-      payload.guideImageUrl
+      (layer.guideImageUrl || payload.guideImageUrl)
         ? '用户还绘制了指导图，但当前接口模式为 generations，无法直接传入该指导图；建议切换到 images/edits。'
         : '',
       colorReferenceUrl
@@ -247,11 +261,12 @@ const alphaPromptForLayer = (payload: GenerationPayload, layer: LayerNode) =>
   [
     '任务：根据提供的拆分颜色结果，生成对应的 Alpha 通道图。',
     `当前图层：${layer.name}。图层类型：${layer.partType}。`,
+    `图层操作：${layer.editSpec.operation}。单层说明：${layer.editSpec.instruction || layer.promptHint || '按图层需求生成 Alpha。'}`,
     '输出必须是一张严格的黑白/灰度 PNG 蒙版，尺寸与颜色结果完全一致。',
     '白色 #FFFFFF 表示完全不透明，黑色 #000000 表示完全透明，灰色表示半透明。',
     '请保留发丝、发光、薄纱、玻璃、烟雾、阴影等半透明过渡。',
     '不要输出彩色内容、线稿、背景、文字、说明或棋盘格。',
-    payload.guideImageUrl
+    (layer.guideImageUrl || payload.guideImageUrl)
       ? '用户绘制的指导图用于提示透明边界和需要保留/擦除的区域，不要把彩色笔触画入蒙版。'
       : '',
   ]
@@ -303,7 +318,11 @@ const requestMergeRecipe = async (
           `图层：${layer.name}`,
           `图层 ID：${layer.id}`,
           `图层类型：${layer.partType}`,
-          `背景版本：${payload.backgrounds.map((background) => `${background.name} ${background.hex}`).join(', ')}`,
+          `操作类型：${layer.editSpec.operation}`,
+          `方位：${layer.side}`,
+          `来源：${layer.sources.map((source) => `${source.role}:${source.layerId}(${source.note})`).join(', ') || '无'}`,
+          `单层说明：${layer.editSpec.instruction || layer.promptHint || '无'}`,
+          `背景版本：${getTierConfig(tierOrDefault(layer.editSpec.algorithmOverride, payload.tier)).backgrounds.map((background) => `${background.name} ${background.hex}`).join(', ')}`,
           '只输出 JSON，不要输出解释文字。',
         ].join('\n'),
       },

@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "isolatedModules": false,
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "types": [],
+    "verbatimModuleSyntax": false
+  },
+  "include": [
+    "src/types/layers.ts",
+    "src/utils/tree.ts",
+    "src/utils/layerTasks.ts",
+    "tests/**/*.ts",
+    "tests/**/*.d.ts"
+  ]
+}
