@@ -17,6 +17,7 @@ import {
   defaultEditSpec,
   markLayerAsReference,
   normalizeTree,
+  type PlannedSplitTarget,
   planSplitForLayer,
   recordLayerRevision,
   rejectLayerNode,
@@ -352,12 +353,12 @@ export const useProjectStore = defineStore('project', () => {
     selectedLayerId.value = id;
   };
 
-  const planSplit = (id: string) => {
+  const planSplit = (id: string, targets?: PlannedSplitTarget[]) => {
     if (pendingReview.value) {
       return;
     }
 
-    draftTree.value = planSplitForLayer(draftTree.value, id);
+    draftTree.value = planSplitForLayer(draftTree.value, id, targets);
     generationMessage.value = '已创建拆分目标图层';
   };
 
@@ -396,12 +397,25 @@ export const useProjectStore = defineStore('project', () => {
     const changed =
       requestedLayer?.type === 'layer'
         ? [requestedLayer]
-        : changedLayers.value.length > 0
-          ? changedLayers.value
-          : flatDraftLayers.value.filter((layer) => layer.type === 'layer' && layer.role !== 'reference');
+          : changedLayers.value.length > 0
+            ? changedLayers.value
+          : flatDraftLayers.value.filter(
+              (layer) =>
+                layer.type === 'layer' &&
+                layer.role !== 'guide' &&
+                (layer.exportable || (layer.role === 'reference' && layer.sources.length > 0)),
+            );
     if (changed.length === 0) {
       return;
     }
+
+    const generationTargets = [...changed].sort((a, b) => {
+      if (a.role === b.role) {
+        return 0;
+      }
+
+      return a.role === 'reference' ? -1 : 1;
+    });
 
     if (!providerReady.value || !providerSettings.value.apiKey.trim()) {
       settingsOpen.value = true;
@@ -411,13 +425,15 @@ export const useProjectStore = defineStore('project', () => {
 
     isGenerating.value = true;
     const maxOutputCount = Math.max(
-      ...changed.map((layer) => getTierConfig(tierOrDefault(layer.editSpec.algorithmOverride, selectedTier.value)).outputCount),
+      ...generationTargets.map((layer) => getTierConfig(tierOrDefault(layer.editSpec.algorithmOverride, selectedTier.value)).outputCount),
     );
-    generationMessage.value = `正在生成最多 ${maxOutputCount} 个背景版本`;
-    const ids = changed.map((layer) => layer.id);
+    generationMessage.value = generationTargets.some((layer) => layer.role === 'reference')
+      ? `正在先生成参考结构，再生成最多 ${maxOutputCount} 个背景版本`
+      : `正在生成最多 ${maxOutputCount} 个背景版本`;
+    const ids = generationTargets.map((layer) => layer.id);
     draftTree.value = updateLayerStatus(draftTree.value, ids, 'generating');
 
-    const prompt = buildSplitPrompt(selectedTier.value, changed, flatDraftLayers.value);
+    const prompt = buildSplitPrompt(selectedTier.value, generationTargets, flatDraftLayers.value);
     lastPrompt.value = prompt;
 
     const payload: GenerationPayload = {
@@ -426,7 +442,7 @@ export const useProjectStore = defineStore('project', () => {
       sourceImageUrl: sourceImageUrl.value,
       guideImageUrl: guideDrawingUrl.value,
       layerTree: cloneTree(draftTree.value),
-      changedLayers: changed,
+      changedLayers: generationTargets,
       prompt,
       backgrounds: tierConfig.value.backgrounds,
     };

@@ -43,6 +43,9 @@ export const buildSplitPrompt = (tier: SplitTier, changedLayers: LayerNode[], fl
     return [
       `- ${layer.name}: ${partPrompt}`,
       `  操作：${operationLabel(layer.editSpec.operation)} / ${layer.editSpec.operation}；方位：${sideLabel(layer.side) || 'none'}；导出：${layer.exportable ? '是' : '否'}。`,
+      layer.role === 'reference'
+        ? '  该目标是参考结构层：请先生成清晰的拆分结构、边界或分区参考，用于后续目标图层继续拆分；不要把它视为最终 PSD 输出。'
+        : '',
       `  来源：${sources}`,
       `  目标结构：${layer.editSpec.targetStructure || '按图层名与部件类型判断'}`,
       `  单层说明：${layer.editSpec.instruction || layer.promptHint || '按 Live2D 可绑定拆分补齐。'}`,

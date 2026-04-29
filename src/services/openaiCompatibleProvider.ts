@@ -77,6 +77,9 @@ const imagePromptForBackground = (
     '',
     `当前只处理图层：${layer.name}。图层类型：${layer.partType}。`,
     `图层操作：${layer.editSpec.operation}。方位：${layer.side}。目标结构：${layer.editSpec.targetStructure || '按图层名判断'}。`,
+    layer.role === 'reference'
+      ? '当前图层是拆分参考结构层。请生成用于指导后续拆分的结构参考图，重点表达分区边界、切分顺序和部件框架；该结果不会作为最终 PSD 输出。'
+      : '',
     `单层修改说明：${layer.editSpec.instruction || layer.promptHint || '按 Live2D 可绑定拆分补齐。'}`,
     `补边需求：向遮挡区域合理延展约 ${layer.editSpec.edgePadding}px；成对部件：${layer.editSpec.paired ? '是' : '否'}；遮罩层：${layer.editSpec.asMask ? '是' : '否'}。`,
     layer.sources.length > 0
@@ -116,13 +119,30 @@ export const runOpenAICompatibleGeneration = async (
   }
 
   const results: GenerationResult[] = [];
+  const generatedLayerImages = new Map<string, string>();
 
   for (const layer of targetLayers) {
     const layerTier = tierOrDefault(layer.editSpec.algorithmOverride, payload.tier);
     const layerConfig = getTierConfig(layerTier);
     if (layerTier === 'modelAlpha') {
-      const colorUrl = await requestImageVersion(payload, layer, layerConfig.backgrounds[0], settings, 'color');
-      const alphaUrl = await requestImageVersion(payload, layer, layerConfig.backgrounds[0], settings, 'alpha', colorUrl);
+      const colorUrl = await requestImageVersion(
+        payload,
+        layer,
+        layerConfig.backgrounds[0],
+        settings,
+        'color',
+        undefined,
+        generatedLayerImages,
+      );
+      const alphaUrl = await requestImageVersion(
+        payload,
+        layer,
+        layerConfig.backgrounds[0],
+        settings,
+        'alpha',
+        colorUrl,
+        generatedLayerImages,
+      );
       const recovered = await recoverFromModelAlpha(colorUrl, alphaUrl);
       const recipe = await requestMergeRecipe(payload, layer, settings);
 
@@ -133,13 +153,22 @@ export const runOpenAICompatibleGeneration = async (
         rgbaUrl: recovered.rgbaUrl,
         promptRecipe: recipe,
       });
+      generatedLayerImages.set(layer.id, recovered.rgbaUrl);
       continue;
     }
 
     const composites: CompositeInput[] = [];
 
     for (const background of layerConfig.backgrounds) {
-      const compositeUrl = await requestImageVersion(payload, layer, background, settings);
+      const compositeUrl = await requestImageVersion(
+        payload,
+        layer,
+        background,
+        settings,
+        'matte',
+        undefined,
+        generatedLayerImages,
+      );
       composites.push({ background, url: compositeUrl });
     }
 
@@ -159,6 +188,7 @@ export const runOpenAICompatibleGeneration = async (
       rgbaUrl: recovered.rgbaUrl,
       promptRecipe: recipe,
     });
+    generatedLayerImages.set(layer.id, recovered.rgbaUrl);
   }
 
   return results;
@@ -171,15 +201,23 @@ const requestImageVersion = async (
   settings: OpenAICompatibleSettings,
   mode: 'matte' | 'color' | 'alpha' = 'matte',
   colorReferenceUrl?: string,
+  generatedLayerImages = new Map<string, string>(),
 ) => {
   const prompt =
     mode === 'alpha'
       ? alphaPromptForLayer(payload, layer)
       : imagePromptForBackground(payload, layer, background, mode);
+  const generatedReferenceImages = layer.sources
+    .map((source) => generatedLayerImages.get(source.layerId))
+    .filter((url): url is string => Boolean(url));
 
   if (
     settings.imageApiMode === 'edits' &&
-    (payload.sourceImageUrl || layer.guideImageUrl || payload.guideImageUrl || colorReferenceUrl)
+    (payload.sourceImageUrl ||
+      layer.guideImageUrl ||
+      payload.guideImageUrl ||
+      colorReferenceUrl ||
+      generatedReferenceImages.length > 0)
   ) {
     const formData = new FormData();
     formData.append('model', settings.imageModel.trim());
@@ -200,6 +238,10 @@ const requestImageVersion = async (
         ? { url: layer.guideImageUrl ?? payload.guideImageUrl ?? '', name: 'drawing-guide.png' }
         : null,
       colorReferenceUrl ? { url: colorReferenceUrl, name: 'color-result.png' } : null,
+      ...generatedReferenceImages.map((url, index) => ({
+        url,
+        name: `structure-reference-${index + 1}.png`,
+      })),
     ].filter((image): image is { url: string; name: string } => Boolean(image));
     const imageFieldName = inputImages.length > 1 ? 'image[]' : 'image';
 
@@ -229,6 +271,9 @@ const requestImageVersion = async (
         : '',
       colorReferenceUrl
         ? '当前需要根据已生成颜色结果生成 Alpha 蒙版，但 generations 模式无法直接传入颜色结果；建议切换到 images/edits。'
+        : '',
+      generatedReferenceImages.length > 0
+        ? `本图层有 ${generatedReferenceImages.length} 张已生成的参考结构图，但 generations 模式无法直接传入；请严格遵循提示词中的参考结构来源说明。`
         : '',
     ]
       .filter(Boolean)

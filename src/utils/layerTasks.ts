@@ -95,6 +95,15 @@ export const summarizeLayerSource = (source: LayerNode, note: string): LayerSour
   note,
 });
 
+export interface PlannedSplitTarget {
+  name: string;
+  side: LayerSide;
+  operation: LayerOperation;
+  instruction: string;
+  paired?: boolean;
+  reference: boolean;
+}
+
 const plannedSplitTemplates: Record<
   SplitPartType,
   Array<{
@@ -103,6 +112,7 @@ const plannedSplitTemplates: Record<
     operation: LayerOperation;
     instruction: string;
     paired?: boolean;
+    reference?: boolean;
   }>
 > = {
   hair: [
@@ -156,28 +166,71 @@ const plannedSplitTemplates: Record<
 
 const getSplitTemplates = (partType: SplitPartType) => plannedSplitTemplates[partType] ?? plannedSplitTemplates.base;
 
-export const planSplitForLayer = (nodes: LayerNode[], sourceId: string): LayerNode[] => {
+export const plannedSplitTargetsForPart = (partType: SplitPartType): PlannedSplitTarget[] =>
+  getSplitTemplates(partType).map((template) => ({
+    name: template.suffix,
+    side: template.side,
+    operation: template.operation,
+    instruction: template.instruction,
+    paired: Boolean(template.paired),
+    reference: Boolean(template.reference),
+  }));
+
+export const planSplitForLayer = (
+  nodes: LayerNode[],
+  sourceId: string,
+  plannedTargets?: PlannedSplitTarget[],
+): LayerNode[] => {
   const source = findLayer(nodes, sourceId);
   if (!source || source.type !== 'layer') {
     return nodes;
   }
 
   const sourceRef = summarizeLayerSource(source, '拆分来源');
-  const targets = getSplitTemplates(source.partType).map((template) =>
-    createLayerNode({
-      name: `${source.name} / ${template.suffix}`,
+  const targets = (plannedTargets ?? plannedSplitTargetsForPart(source.partType)).filter((target) => target.name.trim());
+  const referenceTargets: LayerNode[] = [];
+
+  const createdTargets = targets.map((target) => {
+    const isReference = target.reference;
+    const node = createLayerNode({
+      name: `${source.name} / ${target.name.trim()}`,
       partType: source.partType,
-      side: template.side,
+      side: target.side,
+      role: isReference ? 'reference' : 'artwork',
+      exportable: !isReference,
+      locked: isReference,
       sources: [sourceRef],
       editSpec: {
-        operation: template.operation,
-        instruction: template.instruction,
-        paired: Boolean(template.paired),
-        edgePadding: template.operation === 'backfill' ? 20 : 12,
-        targetStructure: template.suffix,
+        operation: target.operation,
+        instruction: target.instruction,
+        paired: Boolean(target.paired),
+        edgePadding: target.operation === 'backfill' ? 20 : 12,
+        targetStructure: target.name.trim(),
       },
-      promptHint: template.instruction,
-    }),
+      promptHint: target.instruction,
+    });
+
+    if (isReference) {
+      referenceTargets.push(node);
+    }
+
+    return node;
+  });
+
+  const targetsWithReferenceLinks = createdTargets.map((target) =>
+    target.role === 'reference'
+      ? target
+      : {
+          ...target,
+          sources: mergeSources(
+            target.sources,
+            referenceTargets.map((reference) => ({
+              layerId: reference.id,
+              role: 'style',
+              note: '拆分结构参考',
+            })),
+          ),
+        },
   );
 
   let nextNodes = updateLayer(nodes, sourceId, (layer) => ({
@@ -188,7 +241,7 @@ export const planSplitForLayer = (nodes: LayerNode[], sourceId: string): LayerNo
     status: layer.status === 'pendingReview' ? layer.status : 'dirty',
   }));
 
-  for (const target of targets.reverse()) {
+  for (const target of targetsWithReferenceLinks.reverse()) {
     nextNodes = insertLayerAfter(nextNodes, sourceId, target);
   }
 

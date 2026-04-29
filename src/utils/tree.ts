@@ -64,7 +64,11 @@ export const updateLayerStatus = (nodes: LayerNode[], ids: string[], status: Lay
 
 export const collectChangedLayers = (nodes: LayerNode[]) =>
   flattenTree(nodes).filter(
-    (node) => node.type === 'layer' && node.status === 'dirty' && node.role !== 'reference' && node.exportable,
+    (node) =>
+      node.type === 'layer' &&
+      node.status === 'dirty' &&
+      node.role !== 'guide' &&
+      (node.exportable || (node.role === 'reference' && node.sources.length > 0)),
   );
 
 export const hasPendingReview = (nodes: LayerNode[]) =>

@@ -4,6 +4,8 @@ import {
   Boxes,
   Brush,
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleOff,
   Download,
   Eraser,
@@ -19,6 +21,7 @@ import {
   Outdent,
   Plus,
   ScanLine,
+  Search,
   Settings,
   Sparkles,
   Target,
@@ -30,7 +33,13 @@ import { useProjectStore } from './stores/projectStore';
 import { SPLIT_TIER_CONFIGS } from './data/splitTiers';
 import type { FlatLayerNode, LayerNode, SplitPartType, SplitTier } from './types/layers';
 import { loadImage } from './utils/image';
-import { operationLabel, sideLabel } from './utils/layerTasks';
+import { plannedSplitTargetsForPart, type PlannedSplitTarget } from './utils/layerTasks';
+import {
+  filterLayerTreeRows,
+  layerCompactMarker,
+  layerTaskTooltip,
+  type LayerTreeFilter,
+} from './utils/layerTreeUx';
 
 const store = useProjectStore();
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -62,6 +71,14 @@ const contextMenu = ref<{
 const editingLayerId = ref<string | null>(null);
 const editingLayerName = ref('');
 const editingInputRef = ref<HTMLInputElement | null>(null);
+const layerSearchQuery = ref('');
+const layerTreeFilter = ref<LayerTreeFilter>('all');
+const taskDetailsExpanded = ref(false);
+const splitPlanDialog = ref<{
+  sourceId: string;
+  sourceName: string;
+  targets: PlannedSplitTarget[];
+} | null>(null);
 
 const partTypes: Array<{ value: SplitPartType; label: string }> = [
   { value: 'base', label: '基础' },
@@ -85,10 +102,26 @@ const brushColors = [
   { label: '白色', value: 'rgba(248, 250, 252, 0.86)', swatch: '#f8fafc' },
 ];
 
+const layerTreeFilters: Array<{ value: LayerTreeFilter; label: string; title: string }> = [
+  { value: 'all', label: '全部', title: '显示全部图层' },
+  { value: 'dirty', label: '未应用', title: '仅显示已修改但未应用的图层' },
+  { value: 'review', label: '待审', title: '仅显示等待审核的图层' },
+  { value: 'failed', label: '失败', title: '仅显示生成失败的图层' },
+  { value: 'reference', label: '参考', title: '仅显示参考源图层' },
+];
+
 const tierEntries = computed(() =>
   (['estimate', 'modelAlpha', 'standard', 'precise'] satisfies SplitTier[]).map((tier) => SPLIT_TIER_CONFIGS[tier]),
 );
 const selectedLayer = computed(() => store.selectedLayer);
+const sourceNameById = computed(() => new Map(store.flatDraftLayers.map((layer) => [layer.id, layer.name] as const)));
+const visibleTreeRows = computed(() =>
+  filterLayerTreeRows(store.flatDraftLayers, {
+    query: layerSearchQuery.value,
+    status: layerTreeFilter.value,
+    sourceNameById: sourceNameById.value,
+  }),
+);
 const mergeTargetLayers = computed(() =>
   store.flatDraftLayers.filter(
     (layer) => layer.type === 'layer' && layer.id !== contextMenu.value?.layerId,
@@ -104,6 +137,9 @@ const contextLayer = computed(() =>
 );
 const pendingCount = computed(
   () => store.flatDraftLayers.filter((layer) => layer.status === 'pendingReview').length,
+);
+const selectedLayerTooltip = computed(() =>
+  selectedLayer.value ? layerTaskTooltip(selectedLayer.value, sourceNameById.value) : '',
 );
 
 const previewImage = computed(() => {
@@ -139,10 +175,10 @@ const statusLabel = (status: FlatLayerNode['status']) => {
 
 const roleLabel = (role: FlatLayerNode['role']) => {
   const labels: Record<FlatLayerNode['role'], string> = {
-    artwork: '输出',
-    reference: '源',
-    guide: '导',
-    mask: '罩',
+    artwork: '输出图层',
+    reference: '参考源',
+    guide: '指导层',
+    mask: '遮罩层',
   };
 
   return labels[role];
@@ -181,6 +217,28 @@ const sourceSummary = (layer: Pick<LayerNode, 'sources'>) =>
       return `${source.role}: ${sourceLayer?.name ?? source.layerId}`;
     })
     .join('\n');
+
+const compactMarker = (layer: FlatLayerNode) => layerCompactMarker(layer);
+
+const compactMarkerTitle = (layer: FlatLayerNode) => {
+  const marker = compactMarker(layer);
+  if (!marker) {
+    return layerTaskTooltip(layer, sourceNameById.value);
+  }
+
+  return `${marker.label}\n${layerTaskTooltip(layer, sourceNameById.value)}`;
+};
+
+const treeRowTitle = (layer: FlatLayerNode) => layerTaskTooltip(layer, sourceNameById.value);
+
+const filterCountTitle = computed(() =>
+  `当前显示 ${visibleTreeRows.value.length} / ${store.flatDraftLayers.length} 个节点`,
+);
+
+const sourceCountLabel = computed(() => {
+  const count = selectedLayer.value?.sources.length ?? 0;
+  return count === 0 ? '来源 0' : `来源 ${count}`;
+});
 
 const setTier = (tier: SplitTier) => {
   store.setSelectedTier(tier);
@@ -260,15 +318,6 @@ const cancelRenameLayer = () => {
   editingLayerName.value = '';
 };
 
-const splitLayerFromMenu = () => {
-  if (!contextMenu.value) {
-    return;
-  }
-
-  void store.runGeneration(contextMenu.value.layerId);
-  closeContextMenu();
-};
-
 const deleteLayerFromMenu = () => {
   if (!contextMenu.value) {
     return;
@@ -292,8 +341,45 @@ const planSplitFromMenu = () => {
     return;
   }
 
-  store.planSplit(contextMenu.value.layerId);
+  const source = store.flatDraftLayers.find((layer) => layer.id === contextMenu.value?.layerId);
+  if (!source || source.type !== 'layer') {
+    return;
+  }
+
+  splitPlanDialog.value = {
+    sourceId: source.id,
+    sourceName: source.name,
+    targets: plannedSplitTargetsForPart(source.partType),
+  };
   closeContextMenu();
+};
+
+const addSplitPlanTarget = () => {
+  if (!splitPlanDialog.value) {
+    return;
+  }
+
+  splitPlanDialog.value.targets.push({
+    name: `目标 ${splitPlanDialog.value.targets.length + 1}`,
+    side: 'front',
+    operation: 'split',
+    instruction: '',
+    paired: false,
+    reference: false,
+  });
+};
+
+const removeSplitPlanTarget = (index: number) => {
+  splitPlanDialog.value?.targets.splice(index, 1);
+};
+
+const applySplitPlan = () => {
+  if (!splitPlanDialog.value) {
+    return;
+  }
+
+  store.planSplit(splitPlanDialog.value.sourceId, splitPlanDialog.value.targets);
+  splitPlanDialog.value = null;
 };
 
 const addBackfillFromMenu = () => {
@@ -639,7 +725,12 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
 
       <section class="panel layer-panel">
         <div class="layer-head">
-          <span class="layer-head-title" :title="tierTooltip(store.tierConfig)">图层树 · {{ store.tierConfig.shortName }}</span>
+          <div class="layer-head-main">
+            <span class="layer-head-title" :title="`${tierTooltip(store.tierConfig)}\n${filterCountTitle}`">
+              图层树 · {{ store.tierConfig.shortName }}
+            </span>
+            <span class="layer-count" :title="filterCountTitle">{{ visibleTreeRows.length }}/{{ store.flatDraftLayers.length }}</span>
+          </div>
           <div class="toolbar-cluster">
             <button
               class="icon-button primary-icon-button"
@@ -658,6 +749,24 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
               <FolderPlus :size="15" />
             </button>
           </div>
+          <div class="layer-filter-row">
+            <label class="layer-search" title="按图层名、来源、任务说明和目标结构搜索">
+              <Search :size="14" />
+              <input v-model="layerSearchQuery" placeholder="搜索图层" />
+            </label>
+            <div class="filter-tabs" title="筛选图层状态">
+              <button
+                v-for="filter in layerTreeFilters"
+                :key="filter.value"
+                type="button"
+                :class="{ active: layerTreeFilter === filter.value }"
+                :title="filter.title"
+                @click="layerTreeFilter = filter.value"
+              >
+                {{ filter.label }}
+              </button>
+            </div>
+          </div>
         </div>
 
         <div
@@ -673,7 +782,7 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
             :style="{ top: `${layerDropTarget.top}px`, left: `${8 + layerDropTarget.depth * 18}px` }"
           />
           <button
-            v-for="layer in store.flatDraftLayers"
+            v-for="layer in visibleTreeRows"
             :key="layer.id"
             draggable="true"
             :data-layer-id="layer.id"
@@ -685,6 +794,7 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
               dragging: draggedLayerId === layer.id,
             }"
             :style="{ '--depth': layer.depth }"
+            :title="treeRowTitle(layer)"
             @dragstart="startLayerDrag($event, layer)"
             @dragend="cancelLayerDrag"
             @contextmenu="openLayerContextMenu($event, layer)"
@@ -711,30 +821,39 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
             >
               {{ layer.name }}
             </span>
-            <span class="layer-badges" :title="sourceSummary(layer)">
-              <span class="mini-badge" :data-tone="layer.editSpec.operation">{{ operationLabel(layer.editSpec.operation) }}</span>
-              <span v-if="layer.role !== 'artwork'" class="mini-badge" data-tone="reference">{{ roleLabel(layer.role) }}</span>
-              <span v-if="sideLabel(layer.side)" class="mini-badge" data-tone="side">{{ sideLabel(layer.side) }}</span>
+            <span
+              v-if="compactMarker(layer)"
+              class="compact-marker"
+              :data-tone="compactMarker(layer)?.tone"
+              :title="compactMarkerTitle(layer)"
+            >
+              {{ compactMarker(layer)?.label }}
             </span>
-            <span class="layer-status" :data-status="layer.status">{{ statusLabel(layer.status) }}</span>
-            <button
-              v-if="layer.type === 'layer'"
-              class="ghost-icon"
-              :title="layer.visible ? '隐藏图层' : '显示图层'"
-              @click.stop="store.toggleLayerVisible(layer.id)"
-            >
-              <Eye v-if="layer.visible" :size="14" />
-              <EyeOff v-else :size="14" />
-            </button>
-            <button
-              v-if="layer.type === 'layer'"
-              class="ghost-icon"
-              title="单独显示"
-              @click.stop="store.toggleLayerSolo(layer.id)"
-            >
-              <Target :size="14" />
-            </button>
+            <span class="layer-row-actions">
+              <button
+                v-if="layer.type === 'layer'"
+                class="ghost-icon"
+                :class="{ active: !layer.visible }"
+                :title="layer.visible ? '隐藏图层' : '显示图层'"
+                @click.stop="store.toggleLayerVisible(layer.id)"
+              >
+                <Eye v-if="layer.visible" :size="14" />
+                <EyeOff v-else :size="14" />
+              </button>
+              <button
+                v-if="layer.type === 'layer'"
+                class="ghost-icon"
+                :class="{ active: layer.solo }"
+                title="单独显示"
+                @click.stop="store.toggleLayerSolo(layer.id)"
+              >
+                <Target :size="14" />
+              </button>
+            </span>
           </button>
+          <div v-if="visibleTreeRows.length === 0" class="empty-tree-state">
+            没有匹配的图层
+          </div>
         </div>
 
         <div class="layer-footer">
@@ -758,23 +877,30 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
       <section class="panel task-card" v-if="selectedLayer">
         <div class="selected-editor task-detail">
           <div class="task-detail-head">
-            <span>图层任务</span>
+            <span :title="selectedLayerTooltip">图层任务</span>
             <div class="review-actions" v-if="selectedLayer.status === 'pendingReview'">
               <button class="mini-action" title="确认该图层" @click="store.approveLayer(selectedLayer.id)">确认</button>
               <button class="mini-action danger" title="拒绝该图层" @click="store.rejectLayer(selectedLayer.id)">拒绝</button>
             </div>
           </div>
-          <select
-            :value="selectedLayer.partType"
-            title="拆分部件类型"
-            :disabled="store.pendingReview || selectedLayer.locked"
-            @change="store.updateLayerTask(selectedLayer.id, { partType: ($event.target as HTMLSelectElement).value as SplitPartType })"
-          >
-            <option v-for="partType in partTypes" :key="partType.value" :value="partType.value">
-              {{ partType.label }}
-            </option>
-          </select>
-          <div class="task-grid">
+          <div class="task-summary-strip" :title="selectedLayerTooltip">
+            <span class="task-pill">{{ roleLabel(selectedLayer.role) }}</span>
+            <span class="task-pill">{{ operationName(selectedLayer.editSpec.operation) }}</span>
+            <span class="task-pill">方位 {{ sideName(selectedLayer.side) }}</span>
+            <span class="task-pill">{{ selectedLayer.exportable ? '导出' : '不导出' }}</span>
+            <span class="task-pill">{{ sourceCountLabel }}</span>
+          </div>
+          <div class="task-grid compact-task-grid">
+            <select
+              :value="selectedLayer.partType"
+              title="拆分部件类型"
+              :disabled="store.pendingReview || selectedLayer.locked"
+              @change="store.updateLayerTask(selectedLayer.id, { partType: ($event.target as HTMLSelectElement).value as SplitPartType })"
+            >
+              <option v-for="partType in partTypes" :key="partType.value" :value="partType.value">
+                {{ partType.label }}
+              </option>
+            </select>
             <select
               :value="selectedLayer.editSpec.operation"
               title="生成操作类型"
@@ -788,6 +914,8 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
               <option value="repair">修复</option>
               <option value="merge">合并</option>
             </select>
+          </div>
+          <div class="task-grid compact-task-grid">
             <select
               :value="selectedLayer.side"
               title="Live2D 方位"
@@ -801,8 +929,6 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
               <option value="right">右侧</option>
               <option value="inner">内侧</option>
             </select>
-          </div>
-          <div class="task-grid">
             <select
               :value="selectedLayer.role"
               title="图层角色"
@@ -814,6 +940,8 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
               <option value="guide">指导层</option>
               <option value="mask">遮罩层</option>
             </select>
+          </div>
+          <div class="task-compact-row">
             <label class="inline-toggle" title="关闭后不会导出 PSD">
               <input
                 :checked="selectedLayer.exportable"
@@ -823,53 +951,60 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
               />
               导出
             </label>
+            <button class="mini-action detail-toggle" :title="taskDetailsExpanded ? '收起高级任务字段' : '展开高级任务字段'" @click="taskDetailsExpanded = !taskDetailsExpanded">
+              <ChevronDown v-if="taskDetailsExpanded" :size="14" />
+              <ChevronRight v-else :size="14" />
+              高级
+            </button>
           </div>
-          <div class="task-grid">
+          <div v-if="taskDetailsExpanded" class="task-advanced">
+            <div class="task-grid">
+              <input
+                :value="selectedLayer.editSpec.edgePadding"
+                type="number"
+                min="0"
+                max="96"
+                step="1"
+                title="补边像素"
+                :disabled="store.pendingReview || selectedLayer.locked"
+                @change="store.updateLayerTask(selectedLayer.id, { editSpec: { edgePadding: Number(($event.target as HTMLInputElement).value) } })"
+              />
+              <select
+                :value="selectedLayer.editSpec.algorithmOverride ?? ''"
+                title="单层算法覆盖"
+                :disabled="store.pendingReview || selectedLayer.locked"
+                @change="store.updateLayerTask(selectedLayer.id, { editSpec: { algorithmOverride: (($event.target as HTMLSelectElement).value || null) as SplitTier | null } })"
+              >
+                <option value="">跟随设置</option>
+                <option value="estimate">估算</option>
+                <option value="modelAlpha">实验</option>
+                <option value="standard">标准</option>
+                <option value="precise">精确</option>
+              </select>
+            </div>
             <input
-              :value="selectedLayer.editSpec.edgePadding"
-              type="number"
-              min="0"
-              max="96"
-              step="1"
-              title="补边像素"
+              :value="selectedLayer.editSpec.targetStructure"
+              title="目标结构"
+              placeholder="目标结构"
               :disabled="store.pendingReview || selectedLayer.locked"
-              @change="store.updateLayerTask(selectedLayer.id, { editSpec: { edgePadding: Number(($event.target as HTMLInputElement).value) } })"
+              @change="store.updateLayerTask(selectedLayer.id, { editSpec: { targetStructure: ($event.target as HTMLInputElement).value } })"
             />
-            <select
-              :value="selectedLayer.editSpec.algorithmOverride ?? ''"
-              title="单层算法覆盖"
+            <textarea
+              :value="selectedLayer.editSpec.instruction"
+              title="单图层生成说明"
+              placeholder="单图层说明"
               :disabled="store.pendingReview || selectedLayer.locked"
-              @change="store.updateLayerTask(selectedLayer.id, { editSpec: { algorithmOverride: (($event.target as HTMLSelectElement).value || null) as SplitTier | null } })"
-            >
-              <option value="">跟随设置</option>
-              <option value="estimate">估算</option>
-              <option value="modelAlpha">实验</option>
-              <option value="standard">标准</option>
-              <option value="precise">精确</option>
-            </select>
-          </div>
-          <input
-            :value="selectedLayer.editSpec.targetStructure"
-            title="目标结构"
-            placeholder="目标结构"
-            :disabled="store.pendingReview || selectedLayer.locked"
-            @change="store.updateLayerTask(selectedLayer.id, { editSpec: { targetStructure: ($event.target as HTMLInputElement).value } })"
-          />
-          <textarea
-            :value="selectedLayer.editSpec.instruction"
-            title="单图层生成说明"
-            placeholder="单图层说明"
-            :disabled="store.pendingReview || selectedLayer.locked"
-            @change="store.updateLayerTask(selectedLayer.id, { editSpec: { instruction: ($event.target as HTMLTextAreaElement).value } })"
-          />
-          <div class="source-list" :title="sourceSummary(selectedLayer)">
-            <span v-if="selectedLayer.sources.length === 0">无来源，默认参考原始立绘</span>
-            <span v-for="source in selectedLayer.sources" :key="`${source.role}-${source.layerId}`">
-              {{ source.role }} · {{ store.flatDraftLayers.find((layer) => layer.id === source.layerId)?.name ?? source.layerId }}
-            </span>
-          </div>
-          <div class="revision-line" :title="selectedLayer.revisions[0]?.promptRecipe">
-            {{ selectedLayer.revisions[0] ? `${operationName(selectedLayer.revisions[0].operation)} · ${selectedLayer.revisions[0].createdAt}` : `方位 ${sideName(selectedLayer.side)}` }}
+              @change="store.updateLayerTask(selectedLayer.id, { editSpec: { instruction: ($event.target as HTMLTextAreaElement).value } })"
+            />
+            <div class="source-list" :title="sourceSummary(selectedLayer)">
+              <span v-if="selectedLayer.sources.length === 0">无来源，默认参考原始立绘</span>
+              <span v-for="source in selectedLayer.sources" :key="`${source.role}-${source.layerId}`">
+                {{ source.role }} · {{ store.flatDraftLayers.find((layer) => layer.id === source.layerId)?.name ?? source.layerId }}
+              </span>
+            </div>
+            <div class="revision-line" :title="selectedLayer.revisions[0]?.promptRecipe">
+              {{ selectedLayer.revisions[0] ? `${operationName(selectedLayer.revisions[0].operation)} · ${selectedLayer.revisions[0].createdAt}` : `方位 ${sideName(selectedLayer.side)}` }}
+            </div>
           </div>
         </div>
       </section>
@@ -970,9 +1105,6 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
       <button type="button" :disabled="!contextLayer" @click="contextLayer && startRenameLayer(contextLayer)">
         重命名
       </button>
-      <button type="button" :disabled="store.isGenerating || store.pendingReview" @click="splitLayerFromMenu">
-        拆分
-      </button>
       <button type="button" :disabled="!contextLayer || contextLayer.type !== 'layer' || store.pendingReview" @click="planSplitFromMenu">
         规划拆分
       </button>
@@ -1018,6 +1150,69 @@ const countSiblingsBefore = (flatIndex: number, parentId: string | null) =>
       <button type="button" class="danger-menu-item" :disabled="store.pendingReview" @click="deleteLayerFromMenu">
         删除
       </button>
+    </div>
+
+    <div v-if="splitPlanDialog" class="modal-backdrop" @click.self="splitPlanDialog = null">
+      <section class="split-plan-modal">
+        <header class="modal-header">
+          <h2 :title="`来源图层：${splitPlanDialog.sourceName}`">规划拆分</h2>
+          <button class="icon-button" title="关闭" @click="splitPlanDialog = null">
+            <X :size="16" />
+          </button>
+        </header>
+
+        <div class="split-plan-body">
+          <div class="split-plan-list">
+            <div
+              v-for="(target, index) in splitPlanDialog.targets"
+              :key="index"
+              class="split-plan-row"
+              :class="{ reference: target.reference }"
+            >
+              <input v-model="target.name" title="拆分目标名称" placeholder="目标名称" />
+              <select v-model="target.operation" title="操作">
+                <option value="split">拆分</option>
+                <option value="backfill">背面补全</option>
+                <option value="occlusionFill">遮挡补全</option>
+                <option value="repair">修复</option>
+                <option value="manual">手动</option>
+              </select>
+              <select v-model="target.side" title="方位">
+                <option value="none">无</option>
+                <option value="front">前</option>
+                <option value="back">背</option>
+                <option value="left">左</option>
+                <option value="right">右</option>
+                <option value="inner">内</option>
+              </select>
+              <label class="inline-toggle" title="参考目标会先生成结构，不作为最终 PSD 输出">
+                <input v-model="target.reference" type="checkbox" />
+                参考
+              </label>
+              <button class="icon-button" title="删除目标" @click="removeSplitPlanTarget(index)">
+                <X :size="14" />
+              </button>
+              <textarea
+                v-model="target.instruction"
+                title="拆分说明"
+                placeholder="例如：按照百褶裙的每一褶单独拆分"
+              />
+            </div>
+          </div>
+        </div>
+
+        <footer class="modal-footer">
+          <button class="secondary-button" @click="addSplitPlanTarget">
+            <Plus :size="16" />
+            添加目标
+          </button>
+          <button class="secondary-button" @click="splitPlanDialog = null">取消</button>
+          <button class="primary-button" @click="applySplitPlan">
+            <Check :size="16" />
+            应用到图层树
+          </button>
+        </footer>
+      </section>
     </div>
 
     <div v-if="store.settingsOpen" class="modal-backdrop" @click.self="store.closeSettings">
